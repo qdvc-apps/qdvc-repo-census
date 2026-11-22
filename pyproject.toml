@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qdvc-repo-census"
+version = "0.1.0"
+description = "Census of every Git repo in a folder: uncommitted, unpushed and unpulled work across multiple remotes, with offline-server detection."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/qdvc-apps/qdvc-repo-census"
+
+[project.scripts]
+repocensus = "repocensus:main_entry"
+
+[tool.setuptools]
+py-modules = ["repocensus"]
