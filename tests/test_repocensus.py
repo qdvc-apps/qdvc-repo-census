@@ -211,11 +211,24 @@ class MiscTests(unittest.TestCase):
         server = rc.Server("charlie9", homepages=["https://charlie9:3030/"])
         with mock.patch.object(rc, "check_homepage", return_value=(False, "no route to host (direct)")), \
              mock.patch.object(rc, "_resolve_note", return_value="charlie9 resolves to 192.168.1.20"), \
-             mock.patch.object(rc.sys, "platform", "darwin"):
+             mock.patch.object(rc.sys, "platform", "darwin"), \
+             mock.patch.dict(os.environ, {"TERM_PROGRAM": "iTerm.app"}):
             rc.check_server(server, 1)
         self.assertFalse(server.online)
         self.assertEqual(server.notes[0], "charlie9 resolves to 192.168.1.20")
-        self.assertIn("Local Network", server.notes[1])
+        self.assertIn("Local Network privacy is blocking iTerm2", server.notes[1])
+        self.assertIn("switch it off", server.notes[1])
+
+    def test_local_network_hint_only_where_it_applies(self):
+        err = "fatal: unable to access 'https://charlie9:3030/x.git/': Failed to connect to charlie9 port 3030: No route to host"
+        with mock.patch.object(rc.sys, "platform", "darwin"):
+            with mock.patch.dict(os.environ, {"TERM_PROGRAM": "Apple_Terminal"}):
+                self.assertIsNone(rc.macos_local_network_hint(err))  # Terminal.app is exempt
+            with mock.patch.dict(os.environ, {"TERM_PROGRAM": "vscode"}):
+                self.assertIn("VS Code", rc.macos_local_network_hint(err))
+                self.assertIsNone(rc.macos_local_network_hint("Connection refused"))
+        with mock.patch.object(rc.sys, "platform", "linux"):
+            self.assertIsNone(rc.macos_local_network_hint(err))
 
     def test_no_proxy_matcher(self):
         m = rc.no_proxy_matches

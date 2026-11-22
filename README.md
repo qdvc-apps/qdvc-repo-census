@@ -18,7 +18,7 @@ repocensus                   # or: python3 /path/to/repocensus.py
 Example output:
 
 ```
-qdvc-repo-census 0.1.1 - /home/me/projects/client-x (4 repos, depth 1)
+qdvc-repo-census 0.1.2 - /home/me/projects/client-x (4 repos, depth 1)
 
 Servers
   [ok] git.alpha.example    online   remotes: alpha; 4 repos
@@ -107,7 +107,7 @@ Each server line says whether the check went `direct` or `via proxy …`. For an
 
 * If a server runs SSH but no web server, it will always look offline, and its remotes won't be fetched. The same goes for a server reached through an SSH `ProxyJump` host. Use `--no-fetch` to see the cached state. A fallback that tries the git port (e.g. TCP 22) when the homepage doesn't answer would be a small addition.
 * A homepage that answers doesn't guarantee that git access works. Fetch failures are reported separately.
-* On macOS 15 and later, Local Network privacy can block a program from reaching machines on your network, typically with "no route to host". If a LAN server shows that error, the report suggests allowing your terminal app under System Settings > Privacy & Security > Local Network.
+* On macOS 15 and later, Local Network privacy can stop a program from reaching machines on your network. The connection fails with "no route to host", so a LAN server looks offline. Terminal.app and everything run from it are exempt, but other terminal apps (iTerm2, VS Code, Warp and so on) need the permission. When the report shows that error in one of those apps, it adds a hint. If the app is already allowed under System Settings > Privacy & Security > Local Network and it still fails, the permission may be stale. Quit the app, switch its toggle off, open and quit the app once, then switch the toggle back on. See [`cursed-knowledge-reports/`](cursed-knowledge-reports/).
 
 ## Safety
 

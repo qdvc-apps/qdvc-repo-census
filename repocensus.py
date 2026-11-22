@@ -41,7 +41,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 PROG = "repocensus"
 
 # Exit codes.
@@ -80,6 +80,7 @@ NETWORK_ERROR_PATTERNS = (
     "connection refused",
     "no route to host",
     "network is unreachable",
+    "network unreachable",
     "failed to connect to",
     "couldn't connect to server",
     "ssh: connect to host",
@@ -570,11 +571,31 @@ def _resolve_note(host: str) -> str:
     return f"{host} resolves to {', '.join(addrs)}" if addrs else f"{host} resolves to nothing"
 
 
-MACOS_LOCAL_NETWORK_HINT = (
-    "on macOS, 'no route to host' for a machine on your network can mean Local"
-    " Network privacy is blocking this Python: allow your terminal app under"
-    " System Settings > Privacy & Security > Local Network, then restart it"
-)
+_TERM_APP_NAMES = {"iTerm.app": "iTerm2", "vscode": "VS Code", "WarpTerminal": "Warp"}
+
+
+def macos_local_network_hint(text: str) -> Optional[str]:
+    """Hint for 'no route to host' on macOS 15+, where Local Network privacy
+    makes blocked connections fail with EHOSTUNREACH.
+
+    Terminal.app (and everything it runs) is exempt, so there the error is
+    probably a real routing problem and no hint is given. Other terminal apps
+    need the permission, and its state can go stale: iTerm2 was blocked while
+    shown as allowed until the toggle was switched off and on again (see
+    cursed-knowledge-reports/).
+    """
+    if sys.platform != "darwin" or "no route to host" not in text.lower():
+        return None
+    term = os.environ.get("TERM_PROGRAM", "")
+    if term == "Apple_Terminal":
+        return None
+    app = _TERM_APP_NAMES.get(term, term or "the app you ran this from")
+    return (
+        f"on macOS this usually means Local Network privacy is blocking {app}"
+        " (Terminal.app is exempt, so try there to confirm). Allow it under"
+        " System Settings > Privacy & Security > Local Network. If it is already"
+        " allowed, quit it, switch it off, open and quit it once, then switch it back on"
+    )
 
 
 def check_server(server: Server, timeout: float) -> None:
@@ -596,8 +617,9 @@ def check_server(server: Server, timeout: float) -> None:
             details.append(f"{url}: {detail}")
         # Offline: record enough to diagnose it without another round trip.
         notes.append(_resolve_note(server.host))
-        if sys.platform == "darwin" and any("no route to host" in d for d in details):
-            notes.append(MACOS_LOCAL_NETWORK_HINT)
+        hint = macos_local_network_hint(" ".join(details))
+        if hint:
+            notes.append(hint)
         result["online"], result["detail"] = False, "; ".join(details)
 
     t = threading.Thread(target=worker, daemon=True)
@@ -827,6 +849,9 @@ class Census:
             else:
                 kind = classify_fetch_error(res.stderr)
                 remote.fetch_detail = _last_line(res.stderr)
+            hint = macos_local_network_hint(res.stderr)
+            if hint:
+                remote.fetch_detail += f" ({hint})"
             if kind == "network" and ep.kind == "network" and remote.server_key:
                 # Circuit breaker: don't keep hammering a server that just
                 # failed at the network level.
