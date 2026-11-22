@@ -20,7 +20,8 @@ from unittest import mock
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import repocensus as rc  # noqa: E402
 
-PROXY_VARS = ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "all_proxy", "ALL_PROXY")
+PROXY_VARS = ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "all_proxy", "ALL_PROXY",
+              "no_proxy", "NO_PROXY")
 _saved_env = {}
 
 
@@ -174,6 +175,48 @@ class MiscTests(unittest.TestCase):
             self.assertIsNone(rc.proxy_for("https://site.corp.lan/"))
             self.assertEqual(rc.proxy_for("https://11.0.0.1/"), "http://proxy:3128")
 
+    def test_os_proxy_settings_ignored_like_git(self):
+        # On macOS/Windows urllib.request.getproxies() falls back to System
+        # Settings / Internet Options; git never does, so neither must we.
+        with mock.patch.dict(os.environ, {}, clear=False):
+            for k in PROXY_VARS:
+                os.environ.pop(k, None)
+            with mock.patch.object(rc.urllib.request, "getproxies",
+                                   return_value={"https": "http://sysproxy:8080", "http": "http://sysproxy:8080"}), \
+                 mock.patch.object(rc.urllib.request, "proxy_bypass", return_value=False):
+                self.assertIsNone(rc.proxy_for("https://charlie9:3030/"))
+
+    def test_env_proxy_reads_variables_like_curl(self):
+        env = {"HTTP_PROXY": "http://upper:1", "ALL_PROXY": "proxy.lan:3128"}
+        with mock.patch.dict(os.environ, env):
+            for k in ("http_proxy", "https_proxy", "HTTPS_PROXY", "all_proxy"):
+                os.environ.pop(k, None)
+            # curl ignores upper-case HTTP_PROXY; ALL_PROXY is the fallback,
+            # and a proxy without a scheme means http://.
+            self.assertEqual(rc.env_proxy("http"), "http://proxy.lan:3128")
+            self.assertEqual(rc.env_proxy("https"), "http://proxy.lan:3128")
+
+    def test_proxy_label_hides_password(self):
+        self.assertEqual(rc._proxy_label("http://me:secret@proxy.lan:3128"), "http://proxy.lan:3128")
+
+    def test_describe_reason(self):
+        import errno
+        import socket
+        self.assertEqual(rc._describe_reason(OSError(errno.EHOSTUNREACH, "x")), "no route to host")
+        self.assertEqual(rc._describe_reason(socket.gaierror(8, "nodename nor servname provided")),
+                         "host name not found")
+        self.assertEqual(rc._describe_reason(ConnectionRefusedError(61, "refused")), "connection refused")
+
+    def test_macos_offline_diagnosis(self):
+        server = rc.Server("charlie9", homepages=["https://charlie9:3030/"])
+        with mock.patch.object(rc, "check_homepage", return_value=(False, "no route to host (direct)")), \
+             mock.patch.object(rc, "_resolve_note", return_value="charlie9 resolves to 192.168.1.20"), \
+             mock.patch.object(rc.sys, "platform", "darwin"):
+            rc.check_server(server, 1)
+        self.assertFalse(server.online)
+        self.assertEqual(server.notes[0], "charlie9 resolves to 192.168.1.20")
+        self.assertIn("Local Network", server.notes[1])
+
     def test_no_proxy_matcher(self):
         m = rc.no_proxy_matches
         self.assertTrue(m("anything", ["*"]))
@@ -212,6 +255,19 @@ class HomepageTests(unittest.TestCase):
         ok, detail = rc.check_homepage(f"http://127.0.0.1:{self.port}/", 3)
         self.assertTrue(ok)
         self.assertIn("404", detail)
+        self.assertIn("(direct)", detail)
+
+    def test_dead_system_proxy_does_not_hide_reachable_server(self):
+        # Simulates a Mac whose System Settings proxy can't reach the LAN
+        # server: the check must still go direct, as git does.
+        with mock.patch.object(rc.urllib.request, "getproxies",
+                               return_value={"http": "http://127.0.0.1:9", "https": "http://127.0.0.1:9"}):
+            ok, detail = rc.check_homepage(f"http://127.0.0.1:{self.port}/", 3)
+        self.assertTrue(ok, detail)
+
+    def test_bare_hostname_resolution_note(self):
+        self.assertIn("127.0.0.1", rc._resolve_note("localhost"))
+        self.assertIn("does not resolve", rc._resolve_note("no-such-host.invalid"))
 
     def test_closed_port_is_offline(self):
         import socket

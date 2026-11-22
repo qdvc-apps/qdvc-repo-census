@@ -22,11 +22,13 @@ Standard library only; Python 3.9+.
 from __future__ import annotations
 
 import argparse
+import errno
 import ipaddress
 import os
 import re
 import shutil
 import signal
+import socket
 import ssl
 import subprocess
 import sys
@@ -39,7 +41,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 PROG = "repocensus"
 
 # Exit codes.
@@ -369,6 +371,7 @@ class Server:
     repo_count: int = 0
     online: Optional[bool] = None  # None = not checked
     detail: str = ""
+    notes: List[str] = field(default_factory=list)  # diagnosis when offline
     # Set when a fetch failed with a network error after the homepage check
     # passed; later fetches to this server are skipped.
     tripped: str = ""
@@ -425,26 +428,50 @@ def no_proxy_matches(host: str, entries: Sequence[str]) -> bool:
     return False
 
 
+def env_proxy(scheme: str) -> Optional[str]:
+    """The proxy curl (and therefore git) would use for `scheme`.
+
+    Environment variables only, read the way curl reads them: `http_proxy` in
+    lower case only, `https_proxy`/`HTTPS_PROXY`, then `all_proxy`/`ALL_PROXY`.
+
+    Deliberately NOT urllib.request.getproxies(): on macOS (and Windows) that
+    falls back to the proxy in System Settings (or Internet Options) when no
+    environment variable is set. git ignores those settings, so using them
+    sent the check through a proxy that git never uses; a proxy that can't see
+    a LAN host such as `charlie9` then made it look offline.
+    """
+    if scheme == "http":
+        names: Tuple[str, ...] = ("http_proxy",)
+    elif scheme == "https":
+        names = ("https_proxy", "HTTPS_PROXY")
+    else:
+        names = ()
+    for name in names + ("all_proxy", "ALL_PROXY"):
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value if "://" in value else "http://" + value
+    return None
+
+
 def proxy_for(url: str) -> Optional[str]:
-    """The proxy URL a request to `url` would use, or None for direct."""
+    """The proxy URL git would use for `url`, or None for a direct connection."""
     parts = urllib.parse.urlsplit(url)
-    proxy = urllib.request.getproxies().get(parts.scheme)
-    if not proxy:
+    proxy = env_proxy(parts.scheme)
+    if not proxy or no_proxy_matches(parts.hostname or "", _no_proxy_entries()):
         return None
-    host = parts.hostname or ""
-    if no_proxy_matches(host, _no_proxy_entries()):
-        return None
-    try:
-        # Also honour the OS's own bypass list (macOS/Windows system settings).
-        if urllib.request.proxy_bypass(host):
-            return None
-    except Exception:  # proxy_bypass can be platform-quirky
-        pass
     return proxy
 
 
 def _uses_proxy(url: str) -> bool:
     return proxy_for(url) is not None
+
+
+def _proxy_label(proxy: str) -> str:
+    """Proxy URL for display, without any user:password."""
+    parts = urllib.parse.urlsplit(proxy)
+    host = parts.hostname or proxy
+    port = f":{parts.port}" if parts.port else ""
+    return f"{parts.scheme}://{_bracket(host)}{port}"
 
 
 def check_homepage(url: str, timeout: float) -> Tuple[bool, str]:
@@ -459,8 +486,16 @@ def check_homepage(url: str, timeout: float) -> Tuple[bool, str]:
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     proxy = proxy_for(url)
+    route = "direct"
+    if proxy and not proxy.lower().startswith("http://"):
+        # urllib can only tunnel through plain-HTTP proxies (not SOCKS etc.).
+        route = f"direct; proxy {_proxy_label(proxy)} not usable by this check"
+        proxy = None
+    elif proxy:
+        route = f"via proxy {_proxy_label(proxy)}"
     scheme = urllib.parse.urlsplit(url).scheme
-    # An explicit ProxyHandler replaces urllib's own no_proxy logic with ours.
+    # An explicit ProxyHandler stops urllib consulting the environment or the
+    # OS proxy settings itself: proxy_for() has already decided, like git.
     opener = urllib.request.build_opener(
         urllib.request.ProxyHandler({scheme: proxy} if proxy else {}),
         _NoRedirect(),
@@ -469,11 +504,16 @@ def check_homepage(url: str, timeout: float) -> Tuple[bool, str]:
     req = urllib.request.Request(
         url, method="HEAD", headers={"User-Agent": f"qdvc-repo-census/{__version__}"}
     )
+    ok, what = _attempt(opener, req, timeout, bool(proxy))
+    return ok, f"{what} ({route})"
+
+
+def _attempt(opener, req, timeout: float, proxied: bool) -> Tuple[bool, str]:
     try:
         with opener.open(req, timeout=timeout) as resp:
             return True, f"HTTP {resp.status}"
     except urllib.error.HTTPError as exc:
-        if exc.code in (502, 503, 504) and proxy:
+        if exc.code in (502, 503, 504) and proxied:
             return False, f"proxy returned HTTP {exc.code}"
         return True, f"HTTP {exc.code}"
     except urllib.error.URLError as exc:
@@ -497,6 +537,13 @@ def check_homepage(url: str, timeout: float) -> Tuple[bool, str]:
 
 
 def _describe_reason(reason: object) -> str:
+    if isinstance(reason, socket.gaierror):
+        return "host name not found"
+    err = getattr(reason, "errno", None)
+    if err == errno.EHOSTUNREACH:
+        return "no route to host"
+    if err == errno.ENETUNREACH:
+        return "network unreachable"
     if isinstance(reason, TimeoutError) or "timed out" in str(reason):
         return "timed out"
     if isinstance(reason, ConnectionRefusedError):
@@ -507,6 +554,29 @@ def _describe_reason(reason: object) -> str:
     return text or reason.__class__.__name__
 
 
+def _resolve_note(host: str) -> str:
+    """What the host name resolves to, for the diagnosis of an offline server."""
+    try:
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        return f"{host} does not resolve ({exc.strerror or exc})"
+    except OSError as exc:
+        return f"{host}: lookup failed ({exc})"
+    addrs: List[str] = []
+    for info in infos:
+        addr = str(info[4][0])
+        if addr not in addrs:
+            addrs.append(addr)
+    return f"{host} resolves to {', '.join(addrs)}" if addrs else f"{host} resolves to nothing"
+
+
+MACOS_LOCAL_NETWORK_HINT = (
+    "on macOS, 'no route to host' for a machine on your network can mean Local"
+    " Network privacy is blocking this Python: allow your terminal app under"
+    " System Settings > Privacy & Security > Local Network, then restart it"
+)
+
+
 def check_server(server: Server, timeout: float) -> None:
     """Try each homepage in turn; the server is online if any answers.
 
@@ -514,6 +584,7 @@ def check_server(server: Server, timeout: float) -> None:
     not cover DNS lookups, which can stall for a long time on site networks.
     """
     result: Dict[str, object] = {}
+    notes: List[str] = []
 
     def worker() -> None:
         details = []
@@ -523,11 +594,19 @@ def check_server(server: Server, timeout: float) -> None:
                 result["online"], result["detail"] = True, f"{url} -> {detail}"
                 return
             details.append(f"{url}: {detail}")
+        # Offline: record enough to diagnose it without another round trip.
+        notes.append(_resolve_note(server.host))
+        if sys.platform == "darwin" and any("no route to host" in d for d in details):
+            notes.append(MACOS_LOCAL_NETWORK_HINT)
         result["online"], result["detail"] = False, "; ".join(details)
 
     t = threading.Thread(target=worker, daemon=True)
     t.start()
-    t.join(timeout * len(server.homepages) + 3)
+    # Generous: Python tries each resolved address in turn with the full
+    # timeout (no "happy eyeballs" as in curl), so a dead IPv6 address before
+    # a working IPv4 one costs a whole timeout.
+    t.join(timeout * len(server.homepages) * 2 + 5)
+    server.notes = list(notes)
     if "online" in result:
         server.online = bool(result["online"])
         server.detail = str(result["detail"])
@@ -1115,6 +1194,8 @@ def render(
             out.append(f"  {mark} {s.host.ljust(width)}  {state}  remotes: {names}{alias};"
                        f" {_plural(s.repo_count, 'repo')}")
             out.append(style.dim(f"         {s.detail}"))
+            for note in s.notes:
+                out.append(style.dim(f"         {note}"))
             if s.tripped:
                 out.append(style.dim(f"         {s.tripped}; later fetches skipped"))
             elif not s.online:

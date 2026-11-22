@@ -18,13 +18,14 @@ repocensus                   # or: python3 /path/to/repocensus.py
 Example output:
 
 ```
-qdvc-repo-census 0.1.0 - /home/me/projects/client-x (4 repos, depth 1)
+qdvc-repo-census 0.1.1 - /home/me/projects/client-x (4 repos, depth 1)
 
 Servers
   [ok] git.alpha.example    online   remotes: alpha; 4 repos
-         https://git.alpha.example/ -> HTTP 302
+         https://git.alpha.example/ -> HTTP 302 (direct)
   [--] site-office.lan      OFFLINE  remotes: bravo; 4 repos
-         https://site-office.lan/: timed out; http://site-office.lan/: timed out
+         https://site-office.lan/: timed out (direct); http://site-office.lan/: timed out (direct)
+         site-office.lan resolves to 192.168.40.12
          not fetched from; last-known state shown instead
 
 Repositories
@@ -92,12 +93,21 @@ For each repo:
 4. Remotes on hosts that didn't answer are skipped. If a fetch to an online host then fails with a network error, the host is marked as failing and later fetches to it are skipped as well.
 5. Remotes that are local paths are checked by seeing whether the path exists.
 
-Proxies: `https_proxy`/`http_proxy` and `no_proxy` are honoured the way git (via curl) honours them, including CIDR entries such as `10.0.0.0/8`, which Python's own proxy handling ignores. When a check goes via a proxy, a 502, 503 or 504 counts as offline, because that's the proxy saying it couldn't reach the server.
+Proxies: the check makes the same proxy decision git makes over HTTPS (via curl), so the two can't disagree about a host:
+
+* Only environment variables are used: `http_proxy` (lower case only, as in curl), `https_proxy`/`HTTPS_PROXY`, then `all_proxy`/`ALL_PROXY`.
+* The proxy in **macOS System Settings** or **Windows Internet Options** is ignored, because git ignores it too. Python's urllib would otherwise use it whenever no variable is set. That sent LAN hosts such as `https://charlie9:3030/` to a proxy that couldn't reach them, so they showed as offline on a Mac but not on Linux (fixed in 0.1.1).
+* `no_proxy` is matched the way curl matches it, including CIDR entries such as `10.0.0.0/8`, which Python's own matching ignores.
+* When a check goes via a proxy, a 502, 503 or 504 counts as offline, because that's the proxy saying it couldn't reach the server.
+* A proxy set in git's own config (`http.proxy`) isn't used by the check.
+
+Each server line says whether the check went `direct` or `via proxy …`. For an offline server it also says what the host name resolves to.
 
 ### Limits of the homepage check
 
 * If a server runs SSH but no web server, it will always look offline, and its remotes won't be fetched. The same goes for a server reached through an SSH `ProxyJump` host. Use `--no-fetch` to see the cached state. A fallback that tries the git port (e.g. TCP 22) when the homepage doesn't answer would be a small addition.
 * A homepage that answers doesn't guarantee that git access works. Fetch failures are reported separately.
+* On macOS 15 and later, Local Network privacy can block a program from reaching machines on your network, typically with "no route to host". If a LAN server shows that error, the report suggests allowing your terminal app under System Settings > Privacy & Security > Local Network.
 
 ## Safety
 
